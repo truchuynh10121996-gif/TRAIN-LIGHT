@@ -199,9 +199,9 @@ def generate_amount_vn(income_level, tx_type, is_salary_period=False):
     elif tx_type in ['chuyen_noi_bo', 'chuyen_lien_ngan_hang']:
         # Chuyển khoản: đa dạng
         base = np.random.choice(COMMON_AMOUNTS_VN, p=[
-            0.08, 0.12, 0.08, 0.15, 0.10, 0.18,  # 50k-500k
-            0.12, 0.08, 0.04, 0.03,               # 1tr-5tr
-            0.015, 0.005, 0.002                   # 10tr-50tr
+            0.08, 0.12, 0.08, 0.15, 0.10, 0.17,  # 50k-500k (tổng: 0.70)
+            0.12, 0.08, 0.04, 0.03,               # 1tr-5tr (tổng: 0.27)
+            0.02, 0.007, 0.003                    # 10tr-50tr (tổng: 0.03)
         ])
     else:
         # Mua hàng online, POS
