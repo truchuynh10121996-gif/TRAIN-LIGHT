@@ -1,12 +1,14 @@
 """
 ===========================================================================
-🏦 SYNTHETIC DATA GENERATOR CHO LIGHTGBM CHỐNG GIAN LẬN - VIỆT NAM
+🏦 SYNTHETIC DATA GENERATOR CHO LIGHTGBM CHỐNG GIAN LẬN & LỪA ĐẢO - VIỆT NAM
 ===========================================================================
 Ứng dụng Streamlit tạo dữ liệu giả lập chuẩn hành vi người Việt Nam
-để train mô hình LightGBM phát hiện gian lận/lừa đảo ngân hàng.
+để train mô hình LightGBM phát hiện:
+- GIAN LẬN (Fraud): Account Takeover, Mule Account, Card Testing
+- LỪA ĐẢO (Scam): Romance Scam, Investment Scam, Impersonation (giả công an/ngân hàng)
 
 Author: Data Engineering Team - Vietnam Banking
-Version: 1.0.0
+Version: 2.0.0 - Optimized for 500K+ transactions
 ===========================================================================
 """
 
@@ -399,185 +401,186 @@ def generate_base_transactions(n_transactions, n_users, n_recipients, seed=RANDO
 
 
 # ===========================================================================
-# SECTION 2: DERIVED FEATURES
+# SECTION 2: DERIVED FEATURES (TỐI ƯU CHO 200K+ DÒNG)
 # ===========================================================================
 
-def compute_derived_features(df):
+def compute_derived_features_optimized(df, progress_callback=None):
     """
     Tính toán các feature phái sinh từ dữ liệu giao dịch
+    PHIÊN BẢN TỐI ƯU: Sử dụng vectorization và numpy để xử lý nhanh hơn
     Tất cả đều là past-only (không nhìn vào tương lai)
     """
     df = df.copy()
     df = df.sort_values(['user_id', 'timestamp']).reset_index(drop=True)
 
-    # 1. amount_log: Log của số tiền
+    if progress_callback:
+        progress_callback("Đang tính amount features...")
+
+    # 1. amount_log: Log của số tiền (vectorized)
     df['amount_log'] = np.log1p(df['amount'])
 
-    # 2. amount_tier: Phân loại mức tiền
-    def get_amount_tier(amount):
-        if amount < 100_000:
-            return 'micro'      # Dưới 100k
-        elif amount < 500_000:
-            return 'small'      # 100k - 500k
-        elif amount < 2_000_000:
-            return 'medium'     # 500k - 2tr
-        elif amount < 10_000_000:
-            return 'large'      # 2tr - 10tr
-        else:
-            return 'very_large' # Trên 10tr
+    # 2. amount_tier: Phân loại mức tiền (vectorized với np.select)
+    conditions = [
+        df['amount'] < 100_000,
+        df['amount'] < 500_000,
+        df['amount'] < 2_000_000,
+        df['amount'] < 10_000_000,
+    ]
+    choices = ['micro', 'small', 'medium', 'large']
+    df['amount_tier'] = np.select(conditions, choices, default='very_large')
 
-    df['amount_tier'] = df['amount'].apply(get_amount_tier)
-
-    # 3. Time features
+    # 3. Time features (vectorized)
     df['hour_of_day'] = df['timestamp'].dt.hour + df['timestamp'].dt.minute / 60
     df['day_of_week'] = df['timestamp'].dt.dayofweek
     df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
     df['is_night_hours'] = ((df['hour_of_day'] >= 23) | (df['hour_of_day'] < 6)).astype(int)
-    df['is_salary_period'] = df['timestamp'].apply(lambda x: 1 if is_salary_period(x) else 0)
-    df['is_bill_period'] = df['timestamp'].apply(lambda x: 1 if is_bill_period(x) else 0)
 
-    # 4. amount_vs_avg_user: So sánh với trung bình user (past-only)
-    # Tính rolling mean của user
+    # Vectorized salary/bill period
+    days = df['timestamp'].dt.day
+    df['is_salary_period'] = ((days >= 25) | (days <= 5)).astype(int)
+    df['is_bill_period'] = (days <= 10).astype(int)
+
+    if progress_callback:
+        progress_callback("Đang tính amount_vs_avg_user...")
+
+    # 4. amount_vs_avg_user: So sánh với trung bình user (past-only, vectorized)
     df['user_cumsum'] = df.groupby('user_id')['amount'].cumsum() - df['amount']
     df['user_cumcount'] = df.groupby('user_id').cumcount()
-    df['user_avg_past'] = df['user_cumsum'] / df['user_cumcount'].replace(0, 1)
-    df['user_avg_past'] = df['user_avg_past'].fillna(df['amount'])
-    df['amount_vs_avg_user'] = df['amount'] / df['user_avg_past'].replace(0, 1)
-    df['amount_vs_avg_user'] = df['amount_vs_avg_user'].clip(0, 100)  # Giới hạn outliers
+    df['user_avg_past'] = np.where(
+        df['user_cumcount'] > 0,
+        df['user_cumsum'] / df['user_cumcount'],
+        df['amount']
+    )
+    df['amount_vs_avg_user'] = np.where(
+        df['user_avg_past'] > 0,
+        df['amount'] / df['user_avg_past'],
+        1.0
+    )
+    df['amount_vs_avg_user'] = df['amount_vs_avg_user'].clip(0, 100)
     df.drop(['user_cumsum', 'user_cumcount', 'user_avg_past'], axis=1, inplace=True)
 
-    # 5. time_gap_prev_min: Khoảng cách với giao dịch trước (phút)
+    # 5. time_gap_prev_min: Khoảng cách với giao dịch trước (phút) - vectorized
     df['prev_timestamp'] = df.groupby('user_id')['timestamp'].shift(1)
     df['time_gap_prev_min'] = (df['timestamp'] - df['prev_timestamp']).dt.total_seconds() / 60
-    df['time_gap_prev_min'] = df['time_gap_prev_min'].fillna(999999)  # Giao dịch đầu tiên
-    df['time_gap_prev_min'] = df['time_gap_prev_min'].clip(0, 999999)
+    df['time_gap_prev_min'] = df['time_gap_prev_min'].fillna(999999).clip(0, 999999)
     df.drop('prev_timestamp', axis=1, inplace=True)
 
-    # 6. velocity_1h và velocity_24h: Số giao dịch trong 1h và 24h gần đây
+    if progress_callback:
+        progress_callback("Đang tính velocity features (có thể mất vài phút)...")
+
+    # 6-10. Các features cần tính theo user - TỐI ƯU với numba-style approach
+    # Khởi tạo các cột
     df['velocity_1h'] = 0
     df['velocity_24h'] = 0
-
-    # Group by user và tính velocity (past-only)
-    for user_id, group in df.groupby('user_id'):
-        indices = group.index.tolist()
-        timestamps = group['timestamp'].values
-
-        for i, idx in enumerate(indices):
-            current_ts = timestamps[i]
-
-            # Đếm giao dịch trong 1h và 24h trước đó
-            count_1h = 0
-            count_24h = 0
-
-            for j in range(i):
-                time_diff = (current_ts - timestamps[j]) / np.timedelta64(1, 'h')
-                if time_diff <= 1:
-                    count_1h += 1
-                if time_diff <= 24:
-                    count_24h += 1
-
-            df.loc[idx, 'velocity_1h'] = count_1h
-            df.loc[idx, 'velocity_24h'] = count_24h
-
-    # 7. recipient_count_30d: Số người nhận khác nhau trong 30 ngày gần đây
     df['recipient_count_30d'] = 0
-
-    for user_id, group in df.groupby('user_id'):
-        indices = group.index.tolist()
-        timestamps = group['timestamp'].values
-        recipients = group['recipient_id'].values
-
-        for i, idx in enumerate(indices):
-            current_ts = timestamps[i]
-            recent_recipients = set()
-
-            for j in range(i):
-                time_diff = (current_ts - timestamps[j]) / np.timedelta64(1, 'D')
-                if time_diff <= 30:
-                    recent_recipients.add(recipients[j])
-
-            df.loc[idx, 'recipient_count_30d'] = len(recent_recipients)
-
-    # 8. device_count_30d: Số thiết bị khác nhau trong 30 ngày
     df['device_count_30d'] = 0
-
-    for user_id, group in df.groupby('user_id'):
-        indices = group.index.tolist()
-        timestamps = group['timestamp'].values
-        devices = group['device_id'].values
-
-        for i, idx in enumerate(indices):
-            current_ts = timestamps[i]
-            recent_devices = set()
-
-            for j in range(i):
-                time_diff = (current_ts - timestamps[j]) / np.timedelta64(1, 'D')
-                if time_diff <= 30:
-                    recent_devices.add(devices[j])
-
-            df.loc[idx, 'device_count_30d'] = len(recent_devices)
-
-    # 9. is_first_large_tx: Đây có phải giao dịch lớn đầu tiên không
     df['is_first_large_tx'] = 0
-    large_threshold = 5_000_000  # 5 triệu VND
-
-    for user_id, group in df.groupby('user_id'):
-        indices = group.index.tolist()
-        amounts = group['amount'].values
-
-        had_large = False
-        for i, idx in enumerate(indices):
-            if amounts[i] >= large_threshold:
-                if not had_large:
-                    df.loc[idx, 'is_first_large_tx'] = 1
-                    had_large = True
-
-    # 10. recipient_diversity: Số recipient unique / tổng số giao dịch của user (past)
     df['recipient_diversity'] = 0.0
 
-    for user_id, group in df.groupby('user_id'):
-        indices = group.index.tolist()
-        recipients = group['recipient_id'].values
+    # Chuyển timestamp sang số để tính toán nhanh hơn
+    df['ts_numeric'] = df['timestamp'].astype(np.int64) // 10**9  # Unix timestamp
 
+    large_threshold = 5_000_000  # 5 triệu VND
+
+    # Xử lý theo batch user để tối ưu
+    user_groups = df.groupby('user_id')
+    n_users = len(user_groups)
+
+    for user_idx, (user_id, group) in enumerate(user_groups):
+        if progress_callback and user_idx % 500 == 0:
+            progress_callback(f"Đang xử lý user {user_idx}/{n_users}...")
+
+        indices = group.index.values
+        ts_values = group['ts_numeric'].values
+        recipients = group['recipient_id'].values
+        devices = group['device_id'].values
+        amounts = group['amount'].values
+
+        # Tính toán vectorized trong group
         seen_recipients = set()
-        for i, idx in enumerate(indices):
+        seen_devices_30d = {}
+        seen_recipients_30d = {}
+        had_large = False
+
+        for i in range(len(indices)):
+            idx = indices[i]
+            current_ts = ts_values[i]
+
+            # Velocity: đếm giao dịch trong window
+            if i > 0:
+                time_diffs = (current_ts - ts_values[:i]) / 3600  # Chuyển sang giờ
+                df.loc[idx, 'velocity_1h'] = np.sum(time_diffs <= 1)
+                df.loc[idx, 'velocity_24h'] = np.sum(time_diffs <= 24)
+
+                # recipient_count_30d và device_count_30d
+                time_diffs_days = time_diffs / 24
+                mask_30d = time_diffs_days <= 30
+                df.loc[idx, 'recipient_count_30d'] = len(set(recipients[:i][mask_30d]))
+                df.loc[idx, 'device_count_30d'] = len(set(devices[:i][mask_30d]))
+
+            # recipient_diversity
             if i > 0:
                 df.loc[idx, 'recipient_diversity'] = len(seen_recipients) / i
             seen_recipients.add(recipients[i])
+
+            # is_first_large_tx
+            if amounts[i] >= large_threshold and not had_large:
+                df.loc[idx, 'is_first_large_tx'] = 1
+                had_large = True
+
+    df.drop('ts_numeric', axis=1, inplace=True)
 
     return df
 
 
 # ===========================================================================
-# SECTION 3: FRAUD SCENARIOS
+# SECTION 3: FRAUD & SCAM SCENARIOS (GIAN LẬN + LỪA ĐẢO VIỆT NAM)
 # ===========================================================================
 
 def apply_fraud_scenarios(df, fraud_rate=DEFAULT_FRAUD_RATE, seed=RANDOM_SEED):
     """
-    Áp dụng các kịch bản fraud theo hành vi Việt Nam
+    Áp dụng các kịch bản GIAN LẬN và LỪA ĐẢO theo hành vi Việt Nam
+
+    GIAN LẬN (Fraud) - Kẻ gian chiếm đoạt tài khoản:
+    1. Account Takeover - Bị hack tài khoản
+    2. Mule Account - Tài khoản trung gian rửa tiền
+    3. Card Testing - Test thẻ bị đánh cắp
+
+    LỪA ĐẢO (Scam) - Nạn nhân tự nguyện chuyển tiền:
+    4. Romance Scam - Lừa tình cảm
+    5. Investment Scam - Lừa đầu tư/tiền ảo
+    6. Impersonation - Giả mạo công an/ngân hàng
+    7. Job Scam - Lừa việc làm online
+
     Fraud chỉ được sinh theo scenario - không dựa vào phân bố nhãn
     """
     np.random.seed(seed)
     df = df.copy()
 
     n_fraud_target = int(len(df) * fraud_rate)
-    n_fraud_current = 0
 
-    # Chia tỷ lệ cho các scenario
+    # Chia tỷ lệ cho các scenario (GIAN LẬN + LỪA ĐẢO)
     scenario_ratios = {
-        'account_takeover': 0.35,
-        'mule_account': 0.25,
-        'card_testing': 0.20,
-        'social_engineering': 0.20
+        # === GIAN LẬN (Fraud) ===
+        'account_takeover': 0.20,      # Bị hack
+        'mule_account': 0.15,          # Tài khoản trung gian
+        'card_testing': 0.10,          # Test thẻ
+        # === LỪA ĐẢO (Scam) ===
+        'romance_scam': 0.15,          # Lừa tình cảm
+        'investment_scam': 0.15,       # Lừa đầu tư
+        'impersonation_scam': 0.15,    # Giả công an/ngân hàng
+        'job_scam': 0.10               # Lừa việc làm
     }
 
     fraud_indices = []
 
     # =========================================
-    # SCENARIO 1: Account Takeover (bị hack)
+    # SCENARIO 1: Account Takeover (GIAN LẬN - bị hack)
+    # Đặc điểm:
     # - Đổi thiết bị đột ngột
     # - Giao dịch lúc 1-4 AM
     # - Chuyển lớn đến người lạ
+    # - Vị trí khác thường
     # =========================================
     n_ato = int(n_fraud_target * scenario_ratios['account_takeover'])
 
@@ -592,26 +595,23 @@ def apply_fraud_scenarios(df, fraud_rate=DEFAULT_FRAUD_RATE, seed=RANDOM_SEED):
         selected = np.random.choice(ato_candidates, size=n_select, replace=False)
 
         for idx in selected:
-            # Điều chỉnh để phù hợp scenario
             df.loc[idx, 'hour_of_day'] = np.random.uniform(1, 4)
             df.loc[idx, 'is_night_hours'] = 1
             df.loc[idx, 'location_diff_km'] = np.random.uniform(100, 500)
 
-            # Label với xác suất 0.7-0.9
             if np.random.random() < np.random.uniform(0.7, 0.9):
                 df.loc[idx, 'is_fraud'] = 1
                 fraud_indices.append(idx)
 
-    n_fraud_current = len(fraud_indices)
-
     # =========================================
-    # SCENARIO 2: Mule Account
+    # SCENARIO 2: Mule Account (GIAN LẬN - tài khoản trung gian)
+    # Đặc điểm:
     # - Nhiều user nhỏ chuyển nhiều khoản nhỏ
-    # - Recipient nhận từ > 20 người trong 7 ngày
+    # - Recipient nhận từ > 20 người
+    # - Velocity cao bất thường
     # =========================================
     n_mule = int(n_fraud_target * scenario_ratios['mule_account'])
 
-    # Tìm các recipient nhận từ nhiều user
     recipient_sender_count = df.groupby('recipient_id')['user_id'].nunique()
     suspicious_recipients = recipient_sender_count[recipient_sender_count > 15].index.tolist()
 
@@ -626,7 +626,6 @@ def apply_fraud_scenarios(df, fraud_rate=DEFAULT_FRAUD_RATE, seed=RANDOM_SEED):
         selected = np.random.choice(mule_candidates, size=n_select, replace=False)
 
         for idx in selected:
-            # Điều chỉnh velocity cao
             df.loc[idx, 'velocity_1h'] = np.random.randint(5, 15)
             df.loc[idx, 'velocity_24h'] = np.random.randint(20, 50)
 
@@ -634,12 +633,12 @@ def apply_fraud_scenarios(df, fraud_rate=DEFAULT_FRAUD_RATE, seed=RANDOM_SEED):
                 df.loc[idx, 'is_fraud'] = 1
                 fraud_indices.append(idx)
 
-    n_fraud_current = len(fraud_indices)
-
     # =========================================
-    # SCENARIO 3: Card Testing / Scam nhỏ lẻ
+    # SCENARIO 3: Card Testing (GIAN LẬN - test thẻ bị đánh cắp)
+    # Đặc điểm:
     # - Nhiều giao dịch nhỏ (10k-50k)
     # - Nhiều recipient trong thời gian ngắn
+    # - Test xem thẻ còn hoạt động không
     # =========================================
     n_card = int(n_fraud_target * scenario_ratios['card_testing'])
 
@@ -660,34 +659,140 @@ def apply_fraud_scenarios(df, fraud_rate=DEFAULT_FRAUD_RATE, seed=RANDOM_SEED):
                 df.loc[idx, 'is_fraud'] = 1
                 fraud_indices.append(idx)
 
-    n_fraud_current = len(fraud_indices)
-
     # =========================================
-    # SCENARIO 4: Lừa đảo xã hội
-    # - Chuyển tiền lớn ngay sau khi thêm người nhận mới
-    # - new_recipient = 1, amount_tier = large/very_large
+    # SCENARIO 4: Romance Scam (LỪA ĐẢO - lừa tình cảm)
+    # Đặc điểm tại Việt Nam:
+    # - Nạn nhân thường là phụ nữ trung niên, đàn ông độc thân
+    # - Chuyển nhiều lần, tăng dần số tiền
+    # - Giờ giao dịch: tối muộn (chat với "người yêu")
+    # - Lý do: mua quà, mua vé máy bay, đầu tư chung
+    # - Số tiền: từ nhỏ đến rất lớn (1tr - 50tr+)
     # =========================================
-    n_social = int(n_fraud_target * scenario_ratios['social_engineering'])
+    n_romance = int(n_fraud_target * scenario_ratios['romance_scam'])
 
-    social_candidates = df[
+    # Romance scam: người nhận mới + số tiền tăng dần + giờ tối
+    romance_candidates = df[
         (df['is_new_recipient'] == 1) &
-        (df['amount'] >= 5_000_000) &
+        (df['amount'] >= 1_000_000) &
+        (df['amount'] <= 50_000_000) &
+        (df['hour_of_day'] >= 19) &  # Giờ tối (chat với "người yêu")
         (~df.index.isin(fraud_indices))
     ].index.tolist()
 
-    if social_candidates:
-        n_select = min(n_social, len(social_candidates))
-        selected = np.random.choice(social_candidates, size=n_select, replace=False)
+    if romance_candidates:
+        n_select = min(n_romance, len(romance_candidates))
+        selected = np.random.choice(romance_candidates, size=n_select, replace=False)
 
         for idx in selected:
-            # Thường xảy ra trong giờ làm việc (lừa đảo qua điện thoại)
-            df.loc[idx, 'hour_of_day'] = np.random.uniform(9, 17)
+            # Điều chỉnh: thường xảy ra buổi tối, số tiền tăng dần
+            df.loc[idx, 'hour_of_day'] = np.random.uniform(20, 23)
+            df.loc[idx, 'amount_vs_avg_user'] = np.random.uniform(2, 5)  # Cao hơn bình thường
 
             if np.random.random() < np.random.uniform(0.7, 0.9):
                 df.loc[idx, 'is_fraud'] = 1
                 fraud_indices.append(idx)
 
-    # Nếu chưa đủ fraud, bổ sung ngẫu nhiên từ các giao dịch đáng ngờ
+    # =========================================
+    # SCENARIO 5: Investment Scam (LỪA ĐẢO - đầu tư/tiền ảo)
+    # Đặc điểm tại Việt Nam:
+    # - Hứa lợi nhuận cao (30-50%/tháng)
+    # - Đầu tư forex, crypto, chứng khoán giả
+    # - Nạp tiền qua app lừa đảo
+    # - Số tiền lớn, thường là chẵn triệu
+    # - Giờ giao dịch: ban ngày (sau khi đọc quảng cáo)
+    # =========================================
+    n_investment = int(n_fraud_target * scenario_ratios['investment_scam'])
+
+    investment_candidates = df[
+        (df['is_new_recipient'] == 1) &
+        (df['amount'] >= 5_000_000) &  # Đầu tư thường số tiền lớn
+        (df['hour_of_day'] >= 8) &
+        (df['hour_of_day'] <= 17) &  # Giờ làm việc
+        (~df.index.isin(fraud_indices))
+    ].index.tolist()
+
+    if investment_candidates:
+        n_select = min(n_investment, len(investment_candidates))
+        selected = np.random.choice(investment_candidates, size=n_select, replace=False)
+
+        for idx in selected:
+            # Đầu tư scam thường là số chẵn triệu
+            df.loc[idx, 'hour_of_day'] = np.random.uniform(9, 16)
+            df.loc[idx, 'is_first_large_tx'] = np.random.choice([0, 1], p=[0.4, 0.6])
+
+            if np.random.random() < np.random.uniform(0.75, 0.95):
+                df.loc[idx, 'is_fraud'] = 1
+                fraud_indices.append(idx)
+
+    # =========================================
+    # SCENARIO 6: Impersonation Scam (LỪA ĐẢO - giả mạo công an/ngân hàng)
+    # Đặc điểm tại Việt Nam:
+    # - Giả công an: "dính líu rửa tiền, chuyển tiền để điều tra"
+    # - Giả ngân hàng: "tài khoản bị khóa, chuyển để xác minh"
+    # - Giả shipper/bưu điện: "có kiện hàng, thanh toán COD"
+    # - Thường xảy ra ban ngày (giờ hành chính)
+    # - Số tiền lớn, chuyển gấp trong thời gian ngắn
+    # - Nạn nhân hoảng loạn, không suy nghĩ kỹ
+    # =========================================
+    n_impersonation = int(n_fraud_target * scenario_ratios['impersonation_scam'])
+
+    impersonation_candidates = df[
+        (df['is_new_recipient'] == 1) &
+        (df['amount'] >= 10_000_000) &  # Số tiền lớn
+        (df['hour_of_day'] >= 8) &
+        (df['hour_of_day'] <= 17) &  # Giờ hành chính
+        (df['time_gap_prev_min'] < 60) &  # Chuyển gấp
+        (~df.index.isin(fraud_indices))
+    ].index.tolist()
+
+    if impersonation_candidates:
+        n_select = min(n_impersonation, len(impersonation_candidates))
+        selected = np.random.choice(impersonation_candidates, size=n_select, replace=False)
+
+        for idx in selected:
+            # Giả công an thường gọi vào giờ hành chính
+            df.loc[idx, 'hour_of_day'] = np.random.uniform(9, 11.5)  # Sáng
+            df.loc[idx, 'time_gap_prev_min'] = np.random.uniform(5, 30)  # Chuyển rất gấp
+
+            if np.random.random() < np.random.uniform(0.8, 0.95):
+                df.loc[idx, 'is_fraud'] = 1
+                fraud_indices.append(idx)
+
+    # =========================================
+    # SCENARIO 7: Job Scam (LỪA ĐẢO - việc làm online)
+    # Đặc điểm tại Việt Nam:
+    # - "Làm task kiếm tiền online"
+    # - "Nạp tiền để nhận nhiệm vụ"
+    # - "Đặt cọc để nhận việc"
+    # - Số tiền nhỏ ban đầu, tăng dần
+    # - Nhiều giao dịch trong ngày
+    # - Target: sinh viên, người thất nghiệp
+    # =========================================
+    n_job = int(n_fraud_target * scenario_ratios['job_scam'])
+
+    job_candidates = df[
+        (df['is_new_recipient'] == 1) &
+        (df['amount'] >= 100_000) &
+        (df['amount'] <= 2_000_000) &  # Số tiền vừa phải
+        (df['velocity_24h'] >= 2) &  # Nhiều giao dịch trong ngày
+        (~df.index.isin(fraud_indices))
+    ].index.tolist()
+
+    if job_candidates:
+        n_select = min(n_job, len(job_candidates))
+        selected = np.random.choice(job_candidates, size=n_select, replace=False)
+
+        for idx in selected:
+            df.loc[idx, 'velocity_24h'] = np.random.randint(3, 10)
+            df.loc[idx, 'recipient_count_30d'] = np.random.randint(1, 5)
+
+            if np.random.random() < np.random.uniform(0.6, 0.85):
+                df.loc[idx, 'is_fraud'] = 1
+                fraud_indices.append(idx)
+
+    # =========================================
+    # BỔ SUNG: Nếu chưa đủ fraud, thêm từ các giao dịch đáng ngờ
+    # =========================================
     remaining = n_fraud_target - len(fraud_indices)
     if remaining > 0:
         suspicious = df[
@@ -695,7 +800,8 @@ def apply_fraud_scenarios(df, fraud_rate=DEFAULT_FRAUD_RATE, seed=RANDOM_SEED):
                 (df['is_night_hours'] == 1) |
                 (df['is_new_device'] == 1) |
                 (df['amount'] >= 10_000_000) |
-                (df['velocity_1h'] >= 5)
+                (df['velocity_1h'] >= 5) |
+                ((df['is_new_recipient'] == 1) & (df['amount'] >= 3_000_000))
             ) &
             (~df.index.isin(fraud_indices))
         ].index.tolist()
@@ -1071,9 +1177,11 @@ def main():
         layout="wide"
     )
 
-    st.title("🏦 Synthetic Data Generator cho LightGBM Chống Gian Lận")
+    st.title("🏦 Synthetic Data Generator cho LightGBM Chống Gian Lận & Lừa Đảo")
     st.markdown("""
-    **Ứng dụng tạo dữ liệu giả lập chuẩn hành vi người Việt Nam để train mô hình phát hiện gian lận ngân hàng.**
+    **Ứng dụng tạo dữ liệu giả lập chuẩn hành vi người Việt Nam để train mô hình phát hiện:**
+    - **GIAN LẬN (Fraud)**: Account Takeover, Mule Account, Card Testing
+    - **LỪA ĐẢO (Scam)**: Romance Scam, Investment Scam, Giả công an/ngân hàng, Job Scam
 
     ---
     """)
@@ -1084,10 +1192,10 @@ def main():
     n_transactions = st.sidebar.number_input(
         "Số lượng giao dịch",
         min_value=1000,
-        max_value=1_000_000,
+        max_value=500_000,
         value=DEFAULT_N_TRANSACTIONS,
         step=10000,
-        help="Số lượng giao dịch cần tạo"
+        help="Số lượng giao dịch cần tạo (tối đa 500.000)"
     )
 
     n_users = st.sidebar.number_input(
@@ -1177,6 +1285,21 @@ def main():
             31. `risk_score_combined` - Risk tổng hợp
             """)
 
+        st.subheader("🎭 7 Kịch bản")
+        with st.expander("Xem chi tiết kịch bản Fraud/Scam"):
+            st.markdown("""
+            **GIAN LẬN (Fraud) - Kẻ gian chiếm TK:**
+            1. **Account Takeover** (20%) - Bị hack, đổi device, GD lúc 1-4AM
+            2. **Mule Account** (15%) - TK trung gian rửa tiền
+            3. **Card Testing** (10%) - Test thẻ bị cắp
+
+            **LỪA ĐẢO (Scam) - Nạn nhân tự chuyển:**
+            4. **Romance Scam** (15%) - Lừa tình cảm
+            5. **Investment Scam** (15%) - Lừa đầu tư/crypto
+            6. **Impersonation** (15%) - Giả công an/NH
+            7. **Job Scam** (10%) - Lừa việc làm online
+            """)
+
     st.markdown("---")
 
     # Generate button
@@ -1194,11 +1317,14 @@ def main():
                 n_transactions, n_users, n_recipients, random_seed
             )
 
-            # Step 2: Compute derived features
+            # Step 2: Compute derived features (TỐI ƯU cho 200K+ dòng)
             status_text.text("🔢 Đang tính toán derived features...")
             progress_bar.progress(30)
 
-            df = compute_derived_features(df)
+            def update_status(msg):
+                status_text.text(f"🔢 {msg}")
+
+            df = compute_derived_features_optimized(df, progress_callback=update_status)
 
             # Step 3: Apply fraud scenarios
             status_text.text("🎭 Đang áp dụng fraud scenarios...")
